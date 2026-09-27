@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         豆包图像生成助手
+// @name         豆包图像生成助手 v3.4
 // @namespace    https://github.com/Frank-jpeg/doubaoshengtuzhushou
 // @version      3.4
 // @description  支持 TXT 批量文生图、文件夹批量图生图、断点续传，并可选启用下载去水印。
