@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         豆包图像生成助手 v3.4
+// @name         豆包图像生成助手 v3.5
 // @namespace    https://github.com/Frank-jpeg/doubaoshengtuzhushou
-// @version      3.4
-// @description  支持 TXT 批量文生图、文件夹批量图生图、断点续传，并可选启用下载去水印。
+// @version      3.5
+// @description  支持 TXT 批量文生图、文件夹批量图生图、断点续传；异常后间隔 2 分钟自动重试，单任务最多 3 次，限额或手动停止不重试。
 // @author       Codex (UI Redesign by AI)
 // @match        https://www.doubao.com/chat/*
 // @grant        none
@@ -21,7 +21,9 @@
   }
   window.__doubaoImageAutoLoaded__ = true;
 
-  const SCRIPT_VERSION = "3.4";
+  const SCRIPT_VERSION = "3.5";
+  const AUTO_RETRY_DELAY_MS = 2 * 60 * 1000;
+  const AUTO_RETRY_MAX_ATTEMPTS = 3;
   const PANEL_ID = "doubao-image-auto-panel";
   const STATUS_ID = "doubao-image-auto-status";
   const TXT_INPUT_ID = "doubao-image-auto-txt";
@@ -61,6 +63,9 @@
     resumeCheckpoint: null,
     imageModeOpenedAt: 0,
     pendingPrompt: null,
+    autoRetryTimer: null,
+    autoRetryTicker: null,
+    autoRetryAt: 0,
   };
 
   let resumeDbPromise = null;
@@ -369,7 +374,10 @@
     }
 
     if (hint) {
-      hint.textContent = getResumeSummary(checkpoint);
+      const seconds = Math.max(0, Math.ceil((state.autoRetryAt - Date.now()) / 1000));
+      hint.textContent = getResumeSummary(checkpoint) + (state.autoRetryAt
+        ? `；${seconds} 秒后自动重试（第 ${(checkpoint?.autoRetryAttempts || 0) + 1}/${AUTO_RETRY_MAX_ATTEMPTS} 次，强制停止可取消）`
+        : checkpoint?.autoRetryBlockedReason ? `；自动重试已暂停：${checkpoint.autoRetryBlockedReason}` : "");
       hint.style.color = hasResume ? "#93c5fd" : "#94a3b8";
     }
   }
@@ -397,6 +405,7 @@
   }
 
   async function clearResumeCheckpoint(options = {}) {
+    cancelAutoRetry();
     const { preserveStatus = false } = options;
     const checkpoint = state.resumeCheckpoint || readResumeCheckpoint();
     saveResumeCheckpoint(null);
@@ -418,6 +427,96 @@
     state.completedTasks = checkpoint.completedTasks || 0;
     state.currentTaskNumber = hasResumableCheckpoint(checkpoint) ? checkpoint.nextIndex + 1 : 0;
     state.currentTaskLabel = checkpoint.tasks?.[checkpoint.nextIndex]?.label || checkpoint.currentTaskLabel || "";
+  }
+
+  function cancelAutoRetry() {
+    window.clearTimeout(state.autoRetryTimer);
+    window.clearInterval(state.autoRetryTicker);
+    state.autoRetryTimer = null;
+    state.autoRetryTicker = null;
+    state.autoRetryAt = 0;
+    syncResumeControls();
+  }
+
+  function getAutoRetryBlockReason(message) {
+    const text = String(message || "");
+    if (/触发生成上限|明天再来|(?:次数|额度|配额|积分|余额|限额).{0,24}(?:上限|耗尽|用完|用尽|不足|超限|限制)|(?:达到|超过|超出).{0,18}(?:上限|限额|额度|配额)|(?:quota|credits?|balance).{0,30}(?:exceed|exhaust|insufficient|deplet)|insufficient.{0,20}(?:quota|credits?|balance)/i.test(text)) {
+      return "生成限额或额度不足";
+    }
+    if (/操作.{0,6}频繁|请求.{0,6}频繁|请求过多|频率限制|限流|rate.?limit|too many requests|\b429\b/i.test(text)) {
+      return "请求频率受限";
+    }
+    if (/请.{0,6}登录|登录.{0,8}(?:失效|过期)|未登录|验证码|人机验证|安全验证|账号.{0,8}(?:封禁|限制)|账户.{0,8}(?:封禁|限制)|captcha|unauthorized|forbidden|\b(?:401|403)\b/i.test(text)) {
+      return "需要登录或人工验证";
+    }
+    if (/断点文件丢失|断点图片缺少|缺少提示词|提示词.{0,8}(?:格式错误|必须是文本|未通过校验|写入校验失败)|不支持自动填写|未找到真正可编辑|无法写入文本输入框|\[object Object\]|内容.{0,12}(?:违规|不合规)|违反.{0,12}(?:规定|政策|规范)/i.test(text)) {
+      return "需要检查文件、提示词或页面输入框";
+    }
+    return "";
+  }
+
+  async function resumeBatchFromCheckpoint(automatic = false) {
+    if (state.running || (automatic && state.stopRequested)) return;
+    const checkpoint = state.resumeCheckpoint || readResumeCheckpoint();
+    if (!hasResumableCheckpoint(checkpoint)) return;
+    cancelAutoRetry();
+    applyBatchSettings(checkpoint.settings);
+    applyCheckpointProgress(checkpoint);
+    await runBatch(checkpoint.tasks.map((task) => ({ ...task })), {
+      checkpoint,
+      startIndex: checkpoint.nextIndex,
+      automaticResume: automatic,
+      resumeLabel: `${automatic ? "自动重试" : "继续执行"}：从第 ${checkpoint.nextIndex + 1}/${checkpoint.total || checkpoint.tasks.length} 个任务开始`,
+    });
+  }
+
+  function scheduleAutoRetry(message) {
+    cancelAutoRetry();
+    const checkpoint = state.resumeCheckpoint;
+    if (state.running || state.stopRequested || checkpoint?.stoppedManually || !hasResumableCheckpoint(checkpoint)) return;
+    const blockedReason = getAutoRetryBlockReason(message) || getAutoRetryBlockReason(getGenerationLimitMessage());
+    if (blockedReason) {
+      updateResumeCheckpoint({ autoRetryBlockedReason: blockedReason });
+      setStatus(`自动重试已暂停：${blockedReason}。处理后可手动点击“继续上次”`, true);
+      return;
+    }
+    if ((checkpoint.autoRetryAttempts || 0) >= AUTO_RETRY_MAX_ATTEMPTS) {
+      updateResumeCheckpoint({ autoRetryBlockedReason: `已重试 ${AUTO_RETRY_MAX_ATTEMPTS} 次，需手动继续` });
+      setStatus(`已自动重试 ${AUTO_RETRY_MAX_ATTEMPTS} 次仍失败，已停止并保留断点；处理后可点击“继续上次”`, true);
+      return;
+    }
+    updateResumeCheckpoint({ autoRetryBlockedReason: "" });
+    state.autoRetryAt = Date.now() + AUTO_RETRY_DELAY_MS;
+    setStatus(`已保留第 ${checkpoint.nextIndex + 1} 个任务断点，2 分钟后自动重试（第 ${(checkpoint.autoRetryAttempts || 0) + 1}/${AUTO_RETRY_MAX_ATTEMPTS} 次）；“强制停止”可取消`);
+    syncResumeControls();
+    state.autoRetryTicker = window.setInterval(syncResumeControls, 1000);
+    state.autoRetryTimer = window.setTimeout(async () => {
+      cancelAutoRetry();
+      const current = state.resumeCheckpoint;
+      if (state.running || state.stopRequested || current?.stoppedManually ||
+          !hasResumableCheckpoint(current) || current.id !== checkpoint.id || current.nextIndex !== checkpoint.nextIndex) return;
+      const reason = getAutoRetryBlockReason(getGenerationLimitMessage());
+      if (reason) {
+        updateResumeCheckpoint({ autoRetryBlockedReason: reason });
+        setStatus(`自动重试已暂停：${reason}。处理后可手动点击“继续上次”`, true);
+        return;
+      }
+      try {
+        updateResumeCheckpoint({ autoRetryAttempts: (current.autoRetryAttempts || 0) + 1 });
+        await resumeBatchFromCheckpoint(true);
+      } catch (error) {
+        const retryError = error instanceof Error ? error.message : String(error);
+        setStatus(retryError, true);
+        scheduleAutoRetry(retryError);
+      }
+    }, AUTO_RETRY_DELAY_MS);
+  }
+
+  function stopBatch() {
+    state.stopRequested = true;
+    cancelAutoRetry();
+    updateResumeCheckpoint({ stoppedManually: true, autoRetryBlockedReason: "手动停止" });
+    setStatus(state.running ? "正在停止，已取消自动重试" : "已停止，已取消自动重试");
   }
 
   function captureBatchSettings() {
@@ -983,6 +1082,8 @@
     const sendButton = await waitFor(() => findSendButton(), 8000, 200, "发送按钮");
     await sleepRandom(500, 1400);
     if (state.stopRequested) throw new Error("任务已停止");
+    const limitMessage = getGenerationLimitMessage();
+    if (limitMessage) throw new Error(`生成受限，已停止：${limitMessage}`);
     if (!isImagePanelReady()) throw new Error("图像生成模式已退出，已停止发送");
     if (typeof state.pendingPrompt !== "string") throw new Error("提示词未通过校验，已停止发送");
     assertPromptValue(getVisibleEditor(), state.pendingPrompt);
@@ -1106,15 +1207,19 @@
   }
 
   function getGenerationLimitMessage() {
-    const texts = qsa('[data-testid="receive_message"], [data-testid="message_content"], .markdown').map((el) =>
-      (el.textContent || "").replace(/\s+/g, " ").trim(),
-    );
-    const hit = texts.find((text) =>
-      text.includes("今天的生成次数已达到上限") ||
-      text.includes("明天再来免费生成") ||
-      text.includes("生成次数已达到上限"),
-    );
-    return hit || "";
+    // 只检查最新回复及可见提示，避免旧限额记录或用户提示词阻止新任务。
+    let replies = qsa('[data-testid="receive_message"]');
+    if (!replies.length) {
+      replies = qsa('[data-testid="message_content"], .markdown').filter((el) =>
+        !el.closest('[data-testid="send_message"], [data-testid="chat_input_input"], [contenteditable="true"]'),
+      );
+    }
+    const latestReply = replies[replies.length - 1];
+    const notices = qsa('[role="alert"], [role="dialog"], [role="status"], [class*="toast"]')
+      .filter((el) => isVisible(el) && !el.closest(`#${PANEL_ID}`));
+    const nodes = latestReply ? [latestReply, ...notices] : notices;
+    return nodes.map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+      .find((text) => getAutoRetryBlockReason(text)) || "";
   }
 
   async function waitForNewImages(previousSignatures) {
@@ -1123,9 +1228,10 @@
     let stableKey = "";
 
     while (Date.now() < deadline) {
+      if (state.stopRequested) throw new Error("任务已停止");
       const limitMessage = getGenerationLimitMessage();
       if (limitMessage) {
-        throw new Error(`触发生成上限，已停止：${limitMessage}`);
+        throw new Error(`生成受限，已停止：${limitMessage}`);
       }
 
       const cards = getImageCards();
@@ -1591,6 +1697,7 @@
       checkpoint: initialCheckpoint = null,
       startIndex: initialStartIndex = 0,
       resumeLabel = "",
+      automaticResume = false,
     } = options;
     if (state.running) {
       return;
@@ -1605,6 +1712,7 @@
       return;
     }
 
+    cancelAutoRetry();
     state.running = true;
     state.stopRequested = false;
     state.resumeCheckpoint = initialCheckpoint;
@@ -1622,6 +1730,7 @@
     toggleButtons(true);
 
     let nextResumeIndex = initialStartIndex;
+    let retryMessage = null;
     try {
       enableRemoveWatermarkHook();
       if (initialCheckpoint) {
@@ -1633,6 +1742,8 @@
           failedTasks: state.failedTasks,
           lastError: "",
           stoppedManually: false,
+          autoRetryBlockedReason: "",
+          autoRetryAttempts: automaticResume ? initialCheckpoint.autoRetryAttempts || 0 : 0,
         });
       }
       setStatus("正在新建会话");
@@ -1654,40 +1765,19 @@
             stoppedManually: false,
           });
         }
-        try {
-          await runSingleTask(tasks[index], index, tasks.length);
-          nextResumeIndex = index + 1;
-          if (state.resumeCheckpoint) {
-            updateResumeCheckpoint({
-              nextIndex: nextResumeIndex,
-              completedTasks: state.completedTasks,
-              currentTaskNumber: nextResumeIndex < tasks.length ? nextResumeIndex + 1 : tasks.length,
-              currentTaskLabel: tasks[nextResumeIndex]?.label || "",
-              failedTasks: state.failedTasks,
-              lastError: "",
-              stoppedManually: false,
-            });
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (message.includes("等待新图片生成超时")) {
-            addFailedTask(tasks[index], "等待生成超时");
-            setStatus(`任务 ${index + 1}/${tasks.length}：超时，已跳过 ${tasks[index].label}`, true);
-            nextResumeIndex = index + 1;
-            if (state.resumeCheckpoint) {
-              updateResumeCheckpoint({
-                nextIndex: nextResumeIndex,
-                completedTasks: state.completedTasks,
-                currentTaskNumber: nextResumeIndex < tasks.length ? nextResumeIndex + 1 : tasks.length,
-                currentTaskLabel: tasks[nextResumeIndex]?.label || "",
-                failedTasks: state.failedTasks,
-                lastError: `任务超时：${tasks[index].label}`,
-                stoppedManually: false,
-              });
-            }
-            continue;
-          }
-          throw error;
+        await runSingleTask(tasks[index], index, tasks.length);
+        nextResumeIndex = index + 1;
+        if (state.resumeCheckpoint) {
+          updateResumeCheckpoint({
+            nextIndex: nextResumeIndex,
+            completedTasks: state.completedTasks,
+            currentTaskNumber: nextResumeIndex < tasks.length ? nextResumeIndex + 1 : tasks.length,
+            currentTaskLabel: tasks[nextResumeIndex]?.label || "",
+            failedTasks: state.failedTasks,
+            lastError: "",
+            stoppedManually: false,
+            autoRetryAttempts: 0,
+          });
         }
         await sleepRandom(1200, 2600);
       }
@@ -1700,6 +1790,7 @@
       await clearResumeCheckpoint({ preserveStatus: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      retryMessage = message;
       if (state.resumeCheckpoint) {
         updateResumeCheckpoint({
           nextIndex: nextResumeIndex,
@@ -1718,6 +1809,7 @@
         setStatus(`已停止，停在第 ${state.currentTaskNumber}/${state.batchTotal} 个任务`, true);
       }
       toggleButtons(false);
+      if (retryMessage !== null) scheduleAutoRetry(retryMessage);
     }
   }
 
@@ -2296,8 +2388,7 @@
 
         const mode = button.getAttribute("data-mode");
         if (mode === "stop") {
-          state.stopRequested = true;
-          setStatus("正在停止");
+          stopBatch();
           return;
         }
 
@@ -2307,14 +2398,7 @@
             setStatus("没有可继续的断点任务", true);
             return;
           }
-          applyBatchSettings(checkpoint.settings);
-          applyCheckpointProgress(checkpoint);
-          const tasks = checkpoint.tasks.map((task) => ({ ...task }));
-          runBatch(tasks, {
-            checkpoint,
-            startIndex: checkpoint.nextIndex,
-            resumeLabel: `继续执行：从第 ${checkpoint.nextIndex + 1}/${checkpoint.total || checkpoint.tasks.length} 个任务开始`,
-          });
+          await resumeBatchFromCheckpoint();
           return;
         }
 
