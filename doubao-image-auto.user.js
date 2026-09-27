@@ -1,12 +1,16 @@
 // ==UserScript==
-// @name         豆包图像生成助手 v3.2
-// @namespace    https://www.doubao.com/
-// @version      3.2
+// @name         豆包图像生成助手
+// @namespace    https://github.com/Frank-jpeg/doubaoshengtuzhushou
+// @version      3.4
 // @description  支持 TXT 批量文生图、文件夹批量图生图、断点续传，并可选启用下载去水印。
 // @author       Codex (UI Redesign by AI)
 // @match        https://www.doubao.com/chat/*
 // @grant        none
 // @run-at       document-start
+// @homepageURL  https://github.com/Frank-jpeg/doubaoshengtuzhushou
+// @supportURL   https://github.com/Frank-jpeg/doubaoshengtuzhushou/issues
+// @updateURL    https://raw.githubusercontent.com/Frank-jpeg/doubaoshengtuzhushou/main/doubao-image-auto.user.js
+// @downloadURL  https://raw.githubusercontent.com/Frank-jpeg/doubaoshengtuzhushou/main/doubao-image-auto.user.js
 // ==/UserScript==
 
 (function () {
@@ -17,7 +21,7 @@
   }
   window.__doubaoImageAutoLoaded__ = true;
 
-  const SCRIPT_VERSION = "3.2";
+  const SCRIPT_VERSION = "3.4";
   const PANEL_ID = "doubao-image-auto-panel";
   const STATUS_ID = "doubao-image-auto-status";
   const TXT_INPUT_ID = "doubao-image-auto-txt";
@@ -55,6 +59,7 @@
     failedTasks: [],
     resumeCheckpoint: null,
     imageModeOpenedAt: 0,
+    pendingPrompt: null,
   };
 
   let resumeDbPromise = null;
@@ -118,17 +123,25 @@
   }
 
   function getVisibleEditor() {
-    return qsa(
-      [
-        '[data-testid="chat_input_input"]',
-        'textarea[placeholder*="发消息"]',
-        'textarea[placeholder*="输入"]',
-        'textarea',
-        '[role="textbox"][contenteditable="true"]',
-        '[contenteditable="true"][data-slate-editor="true"]',
-        '[contenteditable="true"]',
-      ].join(", "),
-    ).find((el) => isVisible(el) && !el.closest(`#${PANEL_ID}`));
+    // chat_input_input is now a wrapper, not the editable element itself.
+    const selectors = [
+      '[data-testid="chat_input_input"] .ProseMirror[contenteditable="true"]',
+      '[data-testid="chat_input_input"] textarea',
+      '[data-testid="chat_input_input"] [contenteditable="true"]',
+      'textarea[data-testid="chat_input_input"]',
+      '.ProseMirror[contenteditable="true"]',
+      'textarea[placeholder*="发消息"]',
+      'textarea[placeholder*="输入"]',
+      '[role="textbox"][contenteditable="true"]',
+      '[contenteditable="true"][data-slate-editor="true"]',
+      'textarea',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of selectors) {
+      const editor = qsa(selector).find((el) => isVisible(el) && !el.closest(`#${PANEL_ID}`));
+      if (editor) return editor;
+    }
+    return null;
   }
 
   function getClickable(el) {
@@ -632,6 +645,8 @@
   }
 
   function findClickableNewChatTrigger() {
+    const current = qs('[data-testid="create_conversation_button"]');
+    if (current && isVisible(current)) return current;
     const nodes = qsa("button,a,div,span");
     for (const node of nodes) {
       const text = (node.textContent || "").replace(/\s+/g, "");
@@ -748,20 +763,25 @@
   }
 
   function isImagePanelReady() {
-    const panel = getImagePanelState();
-    const hasLegacyControls = Boolean(
-      panel.referenceButton || panel.modelButton || panel.ratioButton || panel.styleButton,
-    );
-    const recentlyOpened = state.imageModeOpenedAt && Date.now() - state.imageModeOpenedAt < 5 * 60 * 1000;
-    return Boolean(panel.editor && isVisible(panel.editor) && (hasLegacyControls || recentlyOpened));
+    const { editor } = getImagePanelState();
+    if (!editor || !isVisible(editor)) return false;
+    const modal = qs('[data-testid="skill-modal-image-creation"]') ||
+      qs('[data-testid="skill-modal-image-skill"]');
+    if (modal && isVisible(modal) && modal.contains(editor)) return true;
+    const root = getEditorContainer(editor);
+    if (!root) return false;
+    const buttons = qsa('button,[role="button"]', root).filter(isVisible);
+    const hasModel = buttons.some((el) => /Seedream|模型/.test(getElementText(el)));
+    const hasRatio = buttons.some((el) => /比例|画幅/.test(getElementText(el)));
+    return hasModel && hasRatio;
   }
 
   function findImageModeTrigger() {
     return (
       qs('[data-testid="skill_bar_button_3"]') ||
+      qs('[data-testid*="image"][data-testid*="button"]') ||
       findButtonNearEditor(["图像生成", "图片生成", "AI绘画", "AI作画"], { exact: false }) ||
       getClickable(findVisibleButtonByAnyText(["图像生成", "图片生成", "AI绘画", "AI作画"], { exact: false })) ||
-      qs('[data-testid*="image"][data-testid*="button"]') ||
       getClickable(findVisibleButtonByAnyText(["AI创作"], { exact: true }))
     );
   }
@@ -802,91 +822,81 @@
     );
   }
 
-  function findReactOnChangeProps(editor) {
-    const fiberKey = Object.keys(editor).find((key) => key.startsWith("__reactFiber$"));
-    if (!fiberKey) {
-      return null;
-    }
+  function normalizePromptText(text) {
+    return text.replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ");
+  }
 
-    let fiber = editor[fiberKey];
-    while (fiber) {
-      const props = fiber.memoizedProps;
-      if (props && typeof props.onChange === "function") {
-        return props;
-      }
-      fiber = fiber.return;
+  function readEditorValue(editor) {
+    if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+      return editor.value;
     }
+    const doc = editor.editor?.view?.state?.doc;
+    return doc ? doc.textBetween(0, doc.content.size, "\n") : (editor.innerText || "");
+  }
 
-    return null;
+  function assertPromptValue(editor, expected) {
+    if (!editor || normalizePromptText(readEditorValue(editor)) !== normalizePromptText(expected)) {
+      throw new Error("提示词写入校验失败，已停止发送。请保留断点并检查输入框。");
+    }
   }
 
   function setEditorValue(editor, text) {
+    if (typeof text !== "string") {
+      throw new Error("提示词必须是文本，已阻止对象被转换成 [object Object]");
+    }
+    text = normalizePromptText(text);
+    editor.focus();
     if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
-      editor.focus();
-      const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), "value")?.set;
-      if (valueSetter) {
-        valueSetter.call(editor, text);
-      } else {
-        editor.value = text;
-      }
+      const proto = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (!setter) throw new Error("无法写入文本输入框");
+      setter.call(editor, text);
       editor.dispatchEvent(new Event("input", { bubbles: true }));
       editor.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    }
-
-    const props = findReactOnChangeProps(editor);
-    if (props) {
-      try {
-        props.onChange([
-          {
-            type: "paragraph",
-            children: [{ text }],
-          },
-        ]);
-        return true;
-      } catch (error) {
-        console.warn("doubao-image-auto react onChange failed:", error);
+    } else if (editor.editor?.view?.state?.schema) {
+      // Current Doubao uses Tiptap/ProseMirror. Dispatch a real document
+      // transaction so its editor model and React state both receive the text.
+      // Build text nodes, never parse prompts as HTML or call ancestor onChange.
+      const view = editor.editor.view;
+      const { schema, doc, tr } = view.state;
+      const paragraphs = text.split("\n").map((line) =>
+        schema.nodes.paragraph.create(null, line ? schema.text(line) : null));
+      view.dispatch(tr.replaceWith(0, doc.content.size, paragraphs).scrollIntoView());
+    } else if (editor.isContentEditable) {
+      // Browser input path for other contenteditable implementations.
+      // Keep DOM mutations inside the editor's normal input handling.
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const changed = text
+        ? document.execCommand("insertText", false, text)
+        : document.execCommand("delete", false);
+      if (!changed && readEditorValue(editor) !== text) {
+        throw new Error("当前输入框不支持自动填写，已停止发送");
       }
+    } else {
+      throw new Error("未找到真正可编辑的输入框，已停止发送");
     }
-
-    editor.focus();
-    editor.textContent = "";
-    editor.dispatchEvent(
-      new InputEvent("input", {
-        bubbles: true,
-        cancelable: true,
-        inputType: "deleteContentBackward",
-        data: null,
-      }),
-    );
-    try {
-      document.execCommand("insertText", false, text);
-    } catch (error) {
-      editor.textContent = text;
-    }
-    editor.dispatchEvent(
-      new InputEvent("input", {
-        bubbles: true,
-        cancelable: true,
-        inputType: "insertText",
-        data: text,
-      }),
-    );
-    return false;
+    assertPromptValue(editor, text);
+    return true;
   }
 
   async function fillPrompt(prompt) {
+    state.pendingPrompt = null;
+    if (typeof prompt !== "string") throw new Error("提示词格式错误：需要文本");
     await ensureImageModeOpen();
     const editor = await waitFor(
       () => (isImagePanelReady() ? getImagePanelState().editor : null),
-      10000,
-      200,
-      "图像生成输入框",
+      10000, 200, "图像生成输入框",
     );
     humanClick(editor);
     await sleepRandom(180, 420);
     setEditorValue(editor, prompt);
     await sleepRandom(450, 900);
+    assertPromptValue(getVisibleEditor(), prompt);
+    state.pendingPrompt = prompt;
   }
 
   function isDisabledElement(el) {
@@ -971,7 +981,12 @@
   async function submitTask() {
     const sendButton = await waitFor(() => findSendButton(), 8000, 200, "发送按钮");
     await sleepRandom(500, 1400);
+    if (state.stopRequested) throw new Error("任务已停止");
+    if (!isImagePanelReady()) throw new Error("图像生成模式已退出，已停止发送");
+    if (typeof state.pendingPrompt !== "string") throw new Error("提示词未通过校验，已停止发送");
+    assertPromptValue(getVisibleEditor(), state.pendingPrompt);
     humanClick(sendButton);
+    state.pendingPrompt = null;
     await sleepRandom(700, 1300);
   }
 
@@ -1053,17 +1068,25 @@
       return false;
     }
     const className = String(img.className || "");
-    return (
-      img.alt === "image" ||
-      className.includes("image-Q7dBqW") ||
-      className.includes("image-item-img-") ||
-      /imagex-sign\.byteimg\.com|flow-imagex-sign\.byteimg\.com/.test(src)
-    );
+    // 只认"生成结果容器 / 生成图专属 class"，刻意不用 CDN 域名判断：
+    // 侧栏会话头像、会话缩略图、16px UI 图标与生成图同在 imagex-sign.byteimg.com 域名下，
+    // 用域名放行会把它们全部当成生成结果（v3.3 的实际故障原因）。
+    const inResultContainer = img.closest('[data-testid="mdbox_image"], .image-item-liO_BU, .image-item-img-container-QRWTte');
+    if (inResultContainer) {
+      return true;
+    }
+    if (className.includes("image-Q7dBqW") || className.includes("image-item-img-")) {
+      return true;
+    }
+    // 兜底：alt="image" 且已加载出真实尺寸（排除 16px 图标/占位）
+    return img.alt === "image" && img.naturalWidth >= 200 && img.naturalHeight >= 200;
   }
 
   function getImageCards() {
     const images = qsa("img").filter((img) => isGeneratedResultImage(img));
-    return images.map((img) => img.closest('[data-testid="mdbox_image"], .image-item-liO_BU, .image-item-img-container-QRWTte') || img);
+    const cards = images.map((img) => img.closest('[data-testid="mdbox_image"], .image-item-liO_BU, .image-item-img-container-QRWTte') || img);
+    // 同一个生成图容器里会挂多张 img（主图 + 悬停叠加层），按 DOM 节点去重
+    return Array.from(new Set(cards));
   }
 
   function getCardImageUrl(card) {
@@ -1180,7 +1203,7 @@
       const card = cards[index];
       const url = getCardImageUrl(card);
       if (url) {
-        await downloadBlobByUrl(url, index, cards.length);
+        await downloadBlobByUrl(url, index, cards.length, false);
         continue;
       }
 
@@ -1197,7 +1220,7 @@
     }
   }
 
-  async function downloadBlobByUrl(url, index, total) {
+  async function downloadBlobByUrl(url, index, total, watermarkFree = true) {
     const response = await fetch(url, {
       method: "GET",
       mode: "cors",
@@ -1216,7 +1239,7 @@
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(objectUrl);
-    setStatus(`正在下载第 ${index + 1}/${total} 张无水印图`);
+    setStatus(`正在下载第 ${index + 1}/${total} 张${watermarkFree ? "无水印图" : "原图"}`);
     await sleep(1200);
   }
 
