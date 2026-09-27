@@ -38,6 +38,7 @@
   const STORAGE_TEXT_NAMING_MODE = "doubao-image-auto-text-naming-mode";
   const STORAGE_DOWNLOAD_COUNT = "doubao-image-auto-download-count";
   const STORAGE_COLLAPSED = "doubao-image-auto-collapsed";
+  const STORAGE_PANEL_POSITION = "doubao-image-auto-panel-position";
   const STORAGE_RESUME_CHECKPOINT = "doubao-image-auto-resume-checkpoint";
   const RESUME_DB_NAME = "doubao-image-auto-resume-db";
   const RESUME_FILE_STORE = "resume-files";
@@ -1770,11 +1771,12 @@
     const host = document.createElement("div");
     host.id = PANEL_ID;
     host.style.position = "fixed";
-    host.style.top = "96px";
+    host.style.top = "24px";
     host.style.right = "24px";
     host.style.width = "360px";
-    host.style.height = "auto";
-    host.style.maxHeight = "calc(100vh - 120px)";
+    host.style.height = "min(760px, calc(100vh - 24px))";
+    host.style.minHeight = "0";
+    host.style.maxHeight = "calc(100vh - 24px)";
     host.style.overflow = "visible";
     host.style.zIndex = "2147483647";
     host.style.transition = "transform 0.28s ease";
@@ -1801,6 +1803,8 @@
         .panel-container {
           position: relative;
           width: 100%;
+          height: 100%;
+          min-height: 0;
           display: flex;
           flex-direction: column;
           color: var(--text-primary);
@@ -1810,7 +1814,7 @@
           border: 1px solid var(--border-light);
           border-radius: var(--radius-lg);
           box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
-          overflow: visible;
+          overflow: hidden;
         }
         .panel-header {
           padding: 16px 20px;
@@ -1819,6 +1823,8 @@
           display: flex;
           justify-content: space-between;
           align-items: center;
+          cursor: move;
+          user-select: none;
         }
         .header-left {
           display: flex;
@@ -1900,6 +1906,8 @@
         }
         .panel-body {
           padding: 16px 20px;
+          min-height: 0;
+          flex: 1 1 auto;
           overflow-y: auto;
           display: flex;
           flex-direction: column;
@@ -2188,6 +2196,62 @@
     const downloadCount = shadow.getElementById(DOWNLOAD_COUNT_ID);
     const toggleButton = shadow.getElementById("doubao-image-auto-toggle");
     const collapsedTransform = "translateX(calc(100% + 24px))";
+    const panelHeader = shadow.querySelector(".panel-header");
+    const storedPosition = (() => {
+      try {
+        const value = JSON.parse(localStorage.getItem(STORAGE_PANEL_POSITION) || "null");
+        return value && Number.isFinite(value.left) && Number.isFinite(value.top) ? value : null;
+      } catch {
+        return null;
+      }
+    })();
+    const clampPanelPosition = (left, top) => {
+      const width = host.offsetWidth || 360;
+      const height = host.offsetHeight || 0;
+      return {
+        left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+        top: Math.max(8, Math.min(top, window.innerHeight - Math.min(height, window.innerHeight) - 8)),
+      };
+    };
+    const setPanelPosition = (left, top, persist = true) => {
+      const position = clampPanelPosition(left, top);
+      host.style.left = `${position.left}px`;
+      host.style.top = `${position.top}px`;
+      host.style.right = "auto";
+      if (persist) {
+        localStorage.setItem(STORAGE_PANEL_POSITION, JSON.stringify(position));
+      }
+    };
+    if (storedPosition) {
+      setPanelPosition(storedPosition.left, storedPosition.top, false);
+    }
+    window.addEventListener("resize", () => {
+      const rect = host.getBoundingClientRect();
+      setPanelPosition(rect.left, rect.top, false);
+    });
+    if (panelHeader) {
+      let dragState = null;
+      panelHeader.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.target instanceof Element && event.target.closest("button")) {
+          return;
+        }
+        const rect = host.getBoundingClientRect();
+        dragState = { offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+        panelHeader.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+      });
+      panelHeader.addEventListener("pointermove", (event) => {
+        if (!dragState) return;
+        setPanelPosition(event.clientX - dragState.offsetX, event.clientY - dragState.offsetY);
+      });
+      const stopDragging = (event) => {
+        if (!dragState) return;
+        dragState = null;
+        panelHeader.releasePointerCapture?.(event.pointerId);
+      };
+      panelHeader.addEventListener("pointerup", stopDragging);
+      panelHeader.addEventListener("pointercancel", stopDragging);
+    }
     const applyCollapsedState = (collapsed) => {
       host.style.transform = collapsed ? collapsedTransform : "translateX(0)";
       if (toggleButton) {
